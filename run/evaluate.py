@@ -15,7 +15,6 @@ import torch.distributed as dist
 from util import metric
 from torch.utils import model_zoo
 
-from MinkowskiEngine import SparseTensor
 from util import config
 from util.util import export_pointcloud, get_palette, \
     convert_labels_with_palette, extract_text_feature, visualize_labels
@@ -32,6 +31,11 @@ def get_parser():
     parser.add_argument('--config', type=str,
                     default='config/scannet/eval_openseg.yaml',
                     help='config file')
+    parser.add_argument('--save_confidence', action='store_true', default=False,
+                    help='save per-point max-softmax confidence scores for the H2 diagnostic')
+    parser.add_argument('--confidence_save_dir', type=str,
+                    default='data/matterport_baseline_confidence/test',
+                    help='directory to write per-scene confidence .npy files')
     parser.add_argument('opts',
                     default=None,
                     help='see config/scannet/test_ours_openseg.yaml for all options',
@@ -41,6 +45,9 @@ def get_parser():
     cfg = config.load_cfg_from_cfg_file(args.config)
     if args.opts is not None:
         cfg = config.merge_cfg_from_list(cfg, args.opts)
+    # Attach the argparse-only flags into the cfg namespace
+    cfg.save_confidence     = args.save_confidence
+    cfg.confidence_save_dir = args.confidence_save_dir
     return cfg
 
 
@@ -281,11 +288,13 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                 masks = []
 
             for i, (coords, feat, label, feat_3d, mask, inds_reverse) in enumerate(tqdm(val_data_loader)):
-                sinput = SparseTensor(feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
+                coords_sparse = coords  # original sparse coords, needed for SparseTensor
                 coords = coords[inds_reverse, :]
                 pcl = coords[:, 1:].cpu().numpy()
 
                 if feature_type == 'distill':
+                    from MinkowskiEngine import SparseTensor
+                    sinput = SparseTensor(feat.cuda(non_blocking=True), coords_sparse.cuda(non_blocking=True))
                     predictions = model(sinput)
                     predictions = predictions[inds_reverse, :]
                     pred = predictions.half() @ text_features.t()
@@ -299,7 +308,20 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                     # Directly assign 'unknown' label to those points during inference.
                         logits_pred[~mask[inds_reverse]] = len(labelset)-1
 
+                    # Save per-point max-cosine-similarity score as confidence proxy
+                    # for the H2 diagnostic (Run 0 baseline).
+                    if getattr(args, 'save_confidence', False):
+                        scene_name = (val_data_loader.dataset.data_paths[i]
+                                      .split('/')[-1].split('.pth')[0])
+                        conf_scores = pred.max(dim=-1)[0].float().cpu().numpy()
+                        conf_dir = getattr(args, 'confidence_save_dir',
+                                           'data/matterport_baseline_confidence/test')
+                        os.makedirs(conf_dir, exist_ok=True)
+                        np.save(os.path.join(conf_dir, f'{scene_name}.npy'), conf_scores)
+
                 elif feature_type == 'ensemble':
+                    from MinkowskiEngine import SparseTensor
+                    sinput = SparseTensor(feat.cuda(non_blocking=True), coords_sparse.cuda(non_blocking=True))
                     feat_fuse = feat_3d.cuda(non_blocking=True)[inds_reverse, :]
                     # pred_fusion = feat_fuse.half() @ text_features.t()
                     pred_fusion = (feat_fuse/(feat_fuse.norm(dim=-1, keepdim=True)+1e-5)).half() @ text_features.t()

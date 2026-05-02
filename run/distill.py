@@ -15,7 +15,6 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
-from MinkowskiEngine import SparseTensor
 from util import config
 from util.util import AverageMeter, intersectionAndUnionGPU, \
     poly_learning_rate, save_checkpoint, \
@@ -247,6 +246,10 @@ def main_worker(gpu, ngpus_per_node, argss):
 
 def get_model(cfg):
     '''Get the 3D model.'''
+
+    if hasattr(cfg, 'feature_type') and cfg.feature_type == 'fusion':
+        # Fusion mode uses only pre-computed 2D features; no 3D model needed.
+        return nn.Module()
 
     model = Model(cfg=cfg)
     return model

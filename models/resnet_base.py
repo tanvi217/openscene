@@ -24,8 +24,13 @@
 
 import torch.nn as nn
 
-import MinkowskiEngine as ME
-from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
+try:
+    import MinkowskiEngine as ME
+    from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
+except ImportError:
+    ME = None
+    BasicBlock = None
+    Bottleneck = None
 
 
 class ResNetBase(nn.Module):

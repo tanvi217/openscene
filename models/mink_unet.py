@@ -22,8 +22,14 @@
 # Networks", CVPR'19 (https://arxiv.org/abs/1904.08755) if you use any part
 # of the code.
 
-import MinkowskiEngine as ME
-from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
+try:
+    import MinkowskiEngine as ME
+    from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
+except ImportError:
+    ME = None
+    BasicBlock = None
+    Bottleneck = None
+
 from models.resnet_base import ResNetBase
 
 

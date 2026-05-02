@@ -18,7 +18,8 @@ class FusedFeatureLoader(Point3DLoader):
                  voxel_size=0.05,
                  split='train', aug=False, memcache_init=False,
                  identifier=7791, loop=1, eval_all=False,
-                 input_color = False,
+                 input_color=False,
+                 return_inds_reconstruct=False,
                  ):
         super().__init__(datapath_prefix=datapath_prefix, voxel_size=voxel_size,
                                            split=split, aug=aug, memcache_init=memcache_init,
@@ -26,6 +27,7 @@ class FusedFeatureLoader(Point3DLoader):
                                            eval_all=eval_all, input_color=input_color)
         self.aug = aug
         self.input_color = input_color # decide whether we use point color values as input
+        self.return_inds_reconstruct = return_inds_reconstruct
 
         # prepare for 3D features
         self.datapath_feat = datapath_prefix_feat
@@ -186,6 +188,9 @@ class FusedFeatureLoader(Point3DLoader):
 
         if self.eval_all:
             return coords, feats, labels, feat_3d, mask, torch.from_numpy(inds_reconstruct).long()
+        if self.return_inds_reconstruct:
+            return (coords, feats, labels, feat_3d, mask,
+                    scene_name, torch.from_numpy(inds_reconstruct).long())
         return coords, feats, labels, feat_3d, mask
 
 def collation_fn(batch):
@@ -231,3 +236,24 @@ def collation_fn_eval_all(batch):
 
     return torch.cat(coords), torch.cat(feats), torch.cat(labels), \
         torch.cat(feat_3d), torch.cat(mask), torch.cat(inds_recons)
+
+
+def collation_fn_adapter(batch):
+    '''Collation for adapter training (return_inds_reconstruct=True, batch_size=1).
+
+    Returns scene_names as a list and inds_reconstruct as a list of tensors
+    (lengths differ per scene so they cannot be concatenated).
+
+    :param batch: list of (coords, feats, labels, feat_3d, mask, scene_name, inds_reconstruct)
+    :return:  coords, feats, labels, feat_3d, mask  --- concatenated tensors
+              scene_names                           --- list[str]
+              inds_list                             --- list[LongTensor]  shape (N_orig_i,)
+    '''
+    coords, feats, labels, feat_3d, mask_chunk, scene_names, inds_list = list(zip(*batch))
+
+    for i in range(len(coords)):
+        coords[i][:, 0] *= i
+
+    return (torch.cat(coords), torch.cat(feats), torch.cat(labels),
+            torch.cat(feat_3d), torch.cat(mask_chunk),
+            list(scene_names), list(inds_list))

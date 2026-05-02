@@ -1,0 +1,54 @@
+# Run 0 — zero-shot fusion baseline + optional --save_confidence (H2 diagnostic).
+# Uses run/evaluate.py (not the adapter). Set DATA paths to your machine.
+#
+#   PYTHONPATH=. python run/evaluate.py --config config/matterport/eval_fusion_baseline.yaml \
+#       --save_confidence --confidence_save_dir data/matterport_baseline_confidence/test
+
+DATA:
+  data_root: data/matterport_3d
+  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
+  feature_2d_extractor: openseg
+  classes: 21
+  aug: False
+  voxel_size: 0.02
+  input_color: False
+  use_shm: False
+
+DISTILL:
+  arch_3d: MinkUNet18A
+  ignore_label: 255
+  train_gpu: [0]
+  workers: 4
+  batch_size: 1
+  batch_size_val: 1
+  base_lr: 0.0001
+  loss_type: cosine
+  loop: 1
+  epochs: 1
+  start_epoch: 0
+  manual_seed: 3407
+  save_path:
+  resume:
+
+TEST:
+  split: test
+  prompt_eng: True
+  mark_no_feature_to_unknown: True
+  feature_type: 'fusion'
+  save_feature_as_numpy: False
+  vis_input: False
+  vis_pred: False
+  vis_gt: False
+  test_workers: 4
+  test_gpu: [0]
+  test_batch_size: 1
+  test_repeats: 1
+  model_path:
+  save_folder: exp/baseline_fusion_eval
+
+Distributed:
+  dist_url: tcp://127.0.0.1:6787
+  dist_backend: 'nccl'
+  multiprocessing_distributed: False
+  world_size: 1
+  rank: 0
