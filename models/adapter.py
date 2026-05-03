@@ -66,3 +66,46 @@ def confidence_masked_entropy(logits, tau):
     if conf_mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device, requires_grad=True)
     return (conf_mask.float() * H).sum() / conf_mask.float().sum()
+
+
+def inverted_masked_entropy(logits, tau):
+    """Entropy minimization on the *uncertain* subset (inverse H2 mask).
+
+    Same detached hard mask as ``confidence_masked_entropy``, but selects
+    points with H(y_i) > tau. Mean entropy is averaged only over that subset.
+    """
+    H = predictive_entropy(logits)
+    inv_mask = (H > tau).detach()
+    if inv_mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+    return (inv_mask.float() * H).sum() / inv_mask.float().sum()
+
+
+def soft_weighted_entropy(logits, temperature=0.5):
+    """Confidence-weighted entropy with continuous detached weights."""
+    H = predictive_entropy(logits)
+    weights = torch.exp(-H / float(temperature)).detach()
+    denom = weights.sum().clamp(min=1e-8)
+    return (weights * H).sum() / denom
+
+
+def pseudo_label_loss(logits, threshold=0.9):
+    """Pseudo-label CE on confident points; returns (loss, fraction_confident)."""
+    probs = F.softmax(logits, dim=-1)
+    max_probs, pseudo_labels = probs.max(dim=-1)
+    conf_mask = (max_probs > float(threshold)).detach()
+    if conf_mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device, requires_grad=True), 0.0
+    loss = F.cross_entropy(logits[conf_mask], pseudo_labels[conf_mask].detach())
+    frac = float(conf_mask.float().mean().item())
+    return loss, frac
+
+
+def temperature_sharpening_loss(logits, sharpening_temp=0.5):
+    """Soft CE against detached temperature-sharpened targets."""
+    with torch.no_grad():
+        probs = F.softmax(logits, dim=-1)
+        sharp = probs.pow(1.0 / float(sharpening_temp))
+        sharp = sharp / sharp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(sharp * log_probs).sum(dim=-1).mean()

@@ -1,11 +1,4 @@
-# Run 3 (optional): supervised + vanilla entropy minimization on all unlabeled points (TENT-style).
-# Tests whether the confidence mask matters vs H2 (adapter_with_entropy.yaml).
-#
-# Loss: J = L_sup + lambda2 * mean(H) over unlabeled points (no masking).
-#
-# Usage:
-#   cd ~/repopt-3d/third_party/openscene
-#   PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_tent.yaml
+# Alternative SSL loss: soft confidence-weighted entropy.
 
 DATA:
   data_root: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_3d
@@ -23,21 +16,22 @@ ADAPTER:
   workers: 4
   base_lr: 0.0001
   weight_decay: 0.0001
-  epochs: 50
+  epochs: 15
   start_epoch: 0
   manual_seed: 42
   print_freq: 20
   save_freq: 10
-  save_path: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_tent
+  save_path: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_soft_entropy
   resume:
   aug: False
   loop: 1
   labeled_indices_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_labeled_indices/train
   labeled_frac: 0.05
   lambda2: 0.1
-  entropy_tau: 1.52
-  entropy_unmasked: True
-  entropy_mode: unmasked
+  entropy_tau: 0.5
+  entropy_unmasked: False
+  entropy_mode: soft_weight
+  soft_entropy_temperature: 0.5
   entropy_warmup_epochs: 5
 
 TEST:
@@ -46,7 +40,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   model_path:
-  save_folder: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_tent/eval
+  save_folder: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_soft_entropy/eval
   confidence_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_baseline_confidence/test
   do_h2_diagnostic: True
 

@@ -33,9 +33,12 @@ ADAPTER:
   aug: False
   loop: 1
   labeled_indices_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_labeled_indices/train
+  labeled_frac: 0.05
   lambda2: 0.1
   entropy_tau: 0.3   # very selective - ~10% most confident unlabeled points only
   entropy_unmasked: False
+  entropy_mode: hard_mask
+  entropy_warmup_epochs: 5
 
 TEST:
   split: test

@@ -3,8 +3,8 @@
 Loss: J(theta, psi) = L_sup + lambda2 * L_ent
 
   L_sup -- cross-entropy on the labeled 5% of points per scene
-  L_ent -- confidence-masked entropy on unlabeled points (H2 regulariser)
-           only points with H(y_i) < tau contribute gradient (mask is .detach()-ed)
+  L_ent -- masked entropy on unlabeled points (H2 regulariser by default:
+           only points with H(y_i) < tau; use entropy_mode inverted_mask for H > tau)
 
 The adapter is a 2-layer residual MLP that transforms 768-dim OpenSeg/CLIP
 features before a linear classifier head.  Frozen fused features are never
@@ -36,8 +36,12 @@ from dataset.feature_loader import FusedFeatureLoader, collation_fn_adapter
 from models.adapter import (
     FeatureAdapter,
     confidence_masked_entropy,
+    inverted_masked_entropy,
     vanilla_entropy_minimization,
     predictive_entropy,
+    soft_weighted_entropy,
+    pseudo_label_loss,
+    temperature_sharpening_loss,
 )
 
 
@@ -207,6 +211,16 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
     lambda2     = getattr(args, 'lambda2', 0.0)
     entropy_tau = getattr(args, 'entropy_tau', None)
     entropy_unmasked = getattr(args, 'entropy_unmasked', False)
+    entropy_mode = getattr(args, 'entropy_mode', 'hard_mask')
+    labeled_frac = float(getattr(args, 'labeled_frac', 0.05))
+    soft_temp = float(getattr(args, 'soft_entropy_temperature', 0.5))
+    pseudo_thr = float(getattr(args, 'pseudo_label_threshold', 0.9))
+    sharp_temp = float(getattr(args, 'sharpening_temperature', 0.5))
+    warmup_epochs = int(getattr(args, 'entropy_warmup_epochs', 0))
+    if warmup_epochs > 0:
+        lambda2_effective = lambda2 * min(1.0, float(epoch + 1) / float(warmup_epochs))
+    else:
+        lambda2_effective = lambda2
 
     for i, (coords, feat, labels, feat_3d, mask, scene_names, inds_list) in enumerate(
             tqdm(train_loader, desc=f'Epoch {epoch + 1}/{args.epochs}')):
@@ -216,22 +230,21 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
 
         # Labeled indices for this scene (original point indices)
         labeled_path = os.path.join(args.labeled_indices_dir, f'{scene_name}.npy')
-        if not os.path.exists(labeled_path):
-            logger.warning(f'No labeled split for {scene_name}, skipping.')
-            continue
-        labeled_arr = np.load(labeled_path)  # original-point indices of labeled points
+        labeled_arr = None
+        if os.path.exists(labeled_path):
+            labeled_arr = np.load(labeled_path)  # original-point indices of labeled points
 
         # Map labeled original points to voxel indices
         N_vox = coords.shape[0]
         N_orig = len(inds_reconstruct)
-        orig_labeled_mask = np.zeros(N_orig, dtype=bool)
-        valid_labeled = labeled_arr[labeled_arr < N_orig]  # safety clip
-        orig_labeled_mask[valid_labeled] = True
-
         is_labeled_vox = np.zeros(N_vox, dtype=bool)
-        labeled_vox_idxs = inds_reconstruct[orig_labeled_mask]
-        valid_vox = labeled_vox_idxs[labeled_vox_idxs < N_vox]  # safety clip
-        is_labeled_vox[valid_vox] = True
+        if labeled_arr is not None:
+            orig_labeled_mask = np.zeros(N_orig, dtype=bool)
+            valid_labeled = labeled_arr[labeled_arr < N_orig]  # safety clip
+            orig_labeled_mask[valid_labeled] = True
+            labeled_vox_idxs = inds_reconstruct[orig_labeled_mask]
+            valid_vox = labeled_vox_idxs[labeled_vox_idxs < N_vox]  # safety clip
+            is_labeled_vox[valid_vox] = True
 
         # Align to visible points (those with fused features)
         # mask: (N_vox,) bool which voxelized points have fused 3D features
@@ -240,6 +253,31 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         mask_bool = mask.bool()
         labels_vis      = labels[mask_bool]                         # (N_vis,)
         is_labeled_vis  = torch.from_numpy(is_labeled_vox)[mask_bool]  # (N_vis,)
+        # Fallback when no pre-generated labeled split exists for the scene:
+        # stable per-scene class-balanced sampling on visible valid points.
+        if labeled_arr is None:
+            valid_vis = (labels_vis != args.ignore_label)
+            vis_idx = valid_vis.nonzero(as_tuple=True)[0]
+            if vis_idx.numel() > 0:
+                content_seed = int(labels_vis[valid_vis].sum().item() % (2**31))
+                content_seed += int(labels_vis.shape[0])
+                gen = torch.Generator()
+                base_seed = int(getattr(args, 'manual_seed', 0) or 0)
+                gen.manual_seed(base_seed + content_seed)
+                sampled = []
+                valid_labels = labels_vis[valid_vis]
+                for cls in valid_labels.unique():
+                    cls_vis_idx = vis_idx[(valid_labels == cls)]
+                    k = max(1, int(len(cls_vis_idx) * labeled_frac))
+                    order = torch.randperm(len(cls_vis_idx), generator=gen)
+                    sampled.append(cls_vis_idx[order[:k]])
+                if sampled:
+                    sampled_idx = torch.cat(sampled, dim=0)
+                    is_labeled_vis = torch.zeros_like(valid_vis)
+                    is_labeled_vis[sampled_idx] = True
+            else:
+                is_labeled_vis = torch.zeros_like(valid_vis)
+            logger.warning(f'No labeled split for {scene_name}, using stable class-balanced fallback.')
 
         feat_3d_cuda = feat_3d.float().cuda()
         logits = adapter(feat_3d_cuda)  # (N_vis, C)
@@ -256,9 +294,26 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         # L_ent: masked entropy (H2) or vanilla entropy (TENT / Run 3)
         is_unlabeled_vis = ~is_labeled_vis
         frac_conf = 0.0
-        if lambda2 > 0.0 and is_unlabeled_vis.sum() > 0:
+        if lambda2_effective > 0.0 and is_unlabeled_vis.sum() > 0:
             logits_u = logits[is_unlabeled_vis]
-            if entropy_unmasked:
+            if entropy_mode == 'pseudo_label':
+                L_ent, frac_conf = pseudo_label_loss(logits_u, threshold=pseudo_thr)
+            elif entropy_mode == 'temp_sharpen':
+                L_ent = temperature_sharpening_loss(logits_u, sharpening_temp=sharp_temp)
+                with torch.no_grad():
+                    H_u = predictive_entropy(logits_u)
+                    frac_conf = (
+                        (H_u < float(entropy_tau)).float().mean().item()
+                        if entropy_tau is not None else 0.0
+                    )
+            elif entropy_mode == 'soft_weight':
+                L_ent = soft_weighted_entropy(logits_u, temperature=soft_temp)
+                with torch.no_grad():
+                    H_u = predictive_entropy(logits_u)
+                    frac_conf = (
+                        torch.exp(-H_u / soft_temp).mean().item()
+                    )
+            elif entropy_unmasked or entropy_mode == 'unmasked':
                 L_ent = vanilla_entropy_minimization(logits_u)
                 with torch.no_grad():
                     H_u = predictive_entropy(logits_u)
@@ -266,6 +321,11 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
                         (H_u < float(entropy_tau)).float().mean().item()
                         if entropy_tau is not None else 0.0
                     )
+            elif entropy_mode == 'inverted_mask' and entropy_tau is not None:
+                L_ent = inverted_masked_entropy(logits_u, tau=float(entropy_tau))
+                with torch.no_grad():
+                    H_u = predictive_entropy(logits_u)
+                    frac_conf = (H_u > float(entropy_tau)).float().mean().item()
             elif entropy_tau is not None:
                 L_ent = confidence_masked_entropy(logits_u, tau=float(entropy_tau))
                 with torch.no_grad():
@@ -276,7 +336,7 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         else:
             L_ent = torch.tensor(0.0, device='cuda')
 
-        loss = L_sup + lambda2 * L_ent
+        loss = L_sup + lambda2_effective * L_ent
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
