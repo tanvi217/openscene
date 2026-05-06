@@ -1,10 +1,12 @@
 """Train a lightweight feature adapter on frozen OpenScene fused features.
 
-Loss: J(theta, psi) = L_sup + lambda2 * L_ent
+Loss: J = L_sup + lambda2 * L_ent + lambda_spatial * L_spatial (optional)
 
   L_sup -- cross-entropy on the labeled 5% of points per scene
   L_ent -- masked entropy on unlabeled points (H2 regulariser by default:
            only points with H(y_i) < tau; use entropy_mode inverted_mask for H > tau)
+  L_spatial -- mean squared difference of softmax probabilities on 6-neighbor
+           voxel edges among visible points (see lambda_spatial, spatial_* options)
 
 The adapter is a 2-layer residual MLP that transforms 768-dim OpenSeg/CLIP
 features before a linear classifier head.  Frozen fused features are never
@@ -42,6 +44,7 @@ from models.adapter import (
     soft_weighted_entropy,
     pseudo_label_loss,
     temperature_sharpening_loss,
+    spatial_probability_smoothness,
 )
 
 
@@ -74,6 +77,43 @@ def get_logger():
     handler.setFormatter(logging.Formatter(fmt))
     log.addHandler(handler)
     return log
+
+
+def _build_voxel_6n_edges_np(xyz_np, unlabeled_mask=None, max_edges=0):
+    """6-neighbor edges in the voxel grid (one undirected edge per +x/+y/+z link).
+
+    ``xyz_np`` is (N, 3) int64/float cast to int. Row i matches ``logits[i]`` for
+    visible voxels. If ``unlabeled_mask`` (N,) bool, keep only edges whose
+    endpoints are both True. If ``max_edges`` > 0, subsample edges uniformly.
+    """
+    n = xyz_np.shape[0]
+    if n == 0:
+        return None
+    pos_to_idx = {}
+    for i in range(n):
+        pos_to_idx[
+            (int(xyz_np[i, 0]), int(xyz_np[i, 1]), int(xyz_np[i, 2]))
+        ] = i
+    edges = []
+    fwd = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+    for i in range(n):
+        x, y, z = int(xyz_np[i, 0]), int(xyz_np[i, 1]), int(xyz_np[i, 2])
+        for dx, dy, dz in fwd:
+            j = pos_to_idx.get((x + dx, y + dy, z + dz))
+            if j is not None:
+                edges.append((i, j))
+    if not edges:
+        return None
+    edges = np.asarray(edges, dtype=np.int64)
+    if unlabeled_mask is not None:
+        m = unlabeled_mask.astype(np.bool_)
+        edges = edges[m[edges[:, 0]] & m[edges[:, 1]]]
+        if edges.shape[0] == 0:
+            return None
+    if max_edges > 0 and edges.shape[0] > max_edges:
+        sel = np.random.choice(edges.shape[0], size=max_edges, replace=False)
+        edges = edges[sel]
+    return edges
 
 
 def main():
@@ -151,6 +191,8 @@ def main():
         writer.add_scalar('loss/total', metrics['loss'],     epoch_log)
         writer.add_scalar('loss/L_sup', metrics['l_sup'],    epoch_log)
         writer.add_scalar('loss/L_ent', metrics['l_ent'],    epoch_log)
+        if getattr(args, 'lambda_spatial', 0.0) > 0.0:
+            writer.add_scalar('loss/L_spatial', metrics['l_spatial'], epoch_log)
         writer.add_scalar('frac_confident', metrics['frac_conf'], epoch_log)
 
         scheduler.step()
@@ -207,8 +249,17 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
     sup_meter  = AverageMeter()
     ent_meter  = AverageMeter()
     conf_meter = AverageMeter()
+    spatial_meter = AverageMeter()
 
     lambda2     = getattr(args, 'lambda2', 0.0)
+    lambda_spatial = float(getattr(args, 'lambda_spatial', 0.0))
+    spatial_warmup = int(getattr(args, 'spatial_warmup_epochs', 0))
+    if spatial_warmup > 0:
+        lambda_sp_effective = lambda_spatial * min(
+            1.0, float(epoch + 1) / float(spatial_warmup)
+        )
+    else:
+        lambda_sp_effective = lambda_spatial
     entropy_tau = getattr(args, 'entropy_tau', None)
     entropy_unmasked = getattr(args, 'entropy_unmasked', False)
     entropy_mode = getattr(args, 'entropy_mode', 'hard_mask')
@@ -336,7 +387,21 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         else:
             L_ent = torch.tensor(0.0, device='cuda')
 
-        loss = L_sup + lambda2_effective * L_ent
+        L_spatial = torch.tensor(0.0, device='cuda')
+        if lambda_sp_effective > 0.0:
+            xyz_np = coords[mask_bool, 1:4].long().cpu().numpy()
+            ul_np = None
+            if getattr(args, 'spatial_smooth_unlabeled_only', True):
+                ul_np = is_unlabeled_vis.cpu().numpy()
+            max_e = int(getattr(args, 'spatial_max_edges', 0))
+            edges_np = _build_voxel_6n_edges_np(
+                xyz_np, unlabeled_mask=ul_np, max_edges=max_e
+            )
+            if edges_np is not None:
+                ei = torch.from_numpy(edges_np).long().cuda()
+                L_spatial = spatial_probability_smoothness(logits, ei)
+
+        loss = L_sup + lambda2_effective * L_ent + lambda_sp_effective * L_spatial
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -345,20 +410,32 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         sup_meter.update(L_sup.item())
         ent_meter.update(L_ent.item())
         conf_meter.update(frac_conf)
+        spatial_meter.update(L_spatial.item())
 
         if (i + 1) % args.print_freq == 0:
-            logger.info(
-                'Epoch [{}/{}][{}/{}]  loss {:.4f}  L_sup {:.4f}  '
-                'L_ent {:.4f}  frac_conf {:.3f}'.format(
-                    epoch + 1, args.epochs, i + 1, len(train_loader),
-                    loss_meter.avg, sup_meter.avg, ent_meter.avg, conf_meter.avg,
+            if lambda_spatial > 0.0:
+                logger.info(
+                    'Epoch [{}/{}][{}/{}]  loss {:.4f}  L_sup {:.4f}  '
+                    'L_ent {:.4f}  L_sp {:.4f}  frac_conf {:.3f}'.format(
+                        epoch + 1, args.epochs, i + 1, len(train_loader),
+                        loss_meter.avg, sup_meter.avg, ent_meter.avg,
+                        spatial_meter.avg, conf_meter.avg,
+                    )
                 )
-            )
+            else:
+                logger.info(
+                    'Epoch [{}/{}][{}/{}]  loss {:.4f}  L_sup {:.4f}  '
+                    'L_ent {:.4f}  frac_conf {:.3f}'.format(
+                        epoch + 1, args.epochs, i + 1, len(train_loader),
+                        loss_meter.avg, sup_meter.avg, ent_meter.avg, conf_meter.avg,
+                    )
+                )
 
     return {
         'loss':      loss_meter.avg,
         'l_sup':     sup_meter.avg,
         'l_ent':     ent_meter.avg,
+        'l_spatial': spatial_meter.avg,
         'frac_conf': conf_meter.avg,
     }
 

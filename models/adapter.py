@@ -101,6 +101,23 @@ def pseudo_label_loss(logits, threshold=0.9):
     return loss, frac
 
 
+def spatial_probability_smoothness(logits, edge_index):
+    """Encourage similar class probabilities across spatial neighbors.
+
+    ``edge_index`` has shape (E, 2) with indices into ``logits`` (row-aligned
+    with visible voxels). Mean squared L2 between softmax vectors per edge.
+
+    Returns a scalar with grad connected to ``logits``; if ``edge_index`` is
+    None or empty, returns a detached zero scalar (no graph connection).
+    """
+    if edge_index is None or edge_index.shape[0] == 0:
+        return logits.sum() * 0.0
+    probs = F.softmax(logits, dim=-1)
+    pi = probs[edge_index[:, 0]]
+    pj = probs[edge_index[:, 1]]
+    return ((pi - pj) ** 2).sum(dim=-1).mean()
+
+
 def temperature_sharpening_loss(logits, sharpening_temp=0.5):
     """Soft CE against detached temperature-sharpened targets."""
     with torch.no_grad():
