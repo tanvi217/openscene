@@ -1,247 +1,221 @@
-<!-- PROJECT LOGO -->
+# Adapter experiments (Matterport3D, low-label regime)
 
-<p align="center">
+This document explains how to run the **supervised-only** adapter, the **entropy-regularized** adapter (H2), and the **spatial-smoothing** variant, what each step does, and how the experiment is set up.
 
-  <h1 align="center"><img src="https://pengsongyou.github.io/media/openscene/logo.png" width="40">OpenScene: 3D Scene Understanding with Open Vocabularies</h1>
-  <p align="center">
-    <a href="https://pengsongyou.github.io"><strong>Songyou Peng</strong></a>
-    ·
-    <a href="https://www.kylegenova.com/"><strong>Kyle Genova</strong></a>
-    ·
-    <a href="https://www.maxjiang.ml/"><strong>Chiyu "Max" Jiang</strong></a>
-    ·
-    <a href="https://taiya.github.io/"><strong>Andrea Tagliasacchi</strong></a>
-    <br>
-    <a href="https://people.inf.ethz.ch/pomarc/"><strong>Marc Pollefeys</strong></a>
-    ·
-    <a href="https://www.cs.princeton.edu/~funk/"><strong>Thomas Funkhouser</strong></a>
-  </p>
-  <h2 align="center">CVPR 2023</h2>
-  <h3 align="center"><a href="https://arxiv.org/abs/2211.15654">Paper</a> | <a href="https://youtu.be/jZxCLHyDJf8">Video</a> | <a href="https://pengsongyou.github.io/openscene">Project Page</a></h3>
-  <div align="center"></div>
-</p>
-<p align="center">
-  <a href="">
-    <img src="https://pengsongyou.github.io/media/openscene/teaser.jpg" alt="Logo" width="100%">
-  </a>
-</p>
-<p align="center">
-<strong>OpenScene</strong> is a zero-shot approach to perform a series of novel 3D scene understanding tasks using open-vocabulary queries.
-</p>
-<br>
+---
 
-<!-- TABLE OF CONTENTS -->
-<details open="open" style='padding: 10px; border-radius:5px 30px 30px 5px; border-style: solid; border-width: 1px;'>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li>
-      <a href="#interactive-demo">Interactive Demo</a>
-    </li>
-    <li>
-      <a href="#installation">Installation</a>
-    </li>
-    <li>
-      <a href="#data-preparation">Data Preparation</a>
-    </li>
-    <li>
-      <a href="#run">Run</a>
-    </li>
-    <li>
-      <a href="#applications">Applications</a>
-    </li>
-    <li>
-      <a href="#todo">TODO</a>
-    </li>
-    <li>
-      <a href="#acknowledgement">Acknowledgement</a>
-    </li>
-    <li>
-      <a href="#citation">Citation</a>
-    </li>
-  </ol>
-</details>
+## What problem this solves
 
-## News :triangular_flag_on_post:
+OpenScene builds a 768-dim fused 2D feature per 3D point. Classification is usually done by matching those features to CLIP text prototypes. Here we train a small **residual MLP adapter + linear head** on top of **frozen** fused features so the model can fit the Matterport 21-class label space with **very few supervised points** (5% of valid points per scene, class-balanced).
 
-- [2023/10/27] Add the code for LSeg per-pixel feature extraction and multi-view fusion. Check [this repo](https://github.com/pengsongyou/lseg_feature_extraction).
-- [2023/03/31] Code is released.
+**Main configs**
 
-## Interactive Demo
-### No GPU is needed! Follow **[this instruction](./demo)** to set up and play with the real-time demo yourself.
+| Config | Loss | Purpose |
+|--------|------|--------|
+| `adapter_sup_only.yaml` | `L_sup` only | Baseline: what supervision alone achieves |
+| `adapter_with_entropy.yaml` | `L_sup + λ₂ · L_ent` | H2: **confidence-masked** predictive-entropy on unlabeled points (only `H(pred) < τ`) |
+| `adapter_spatial_smooth.yaml` | `L_sup + λ₂ · L_ent + λ_sp · L_spatial` | Same as H2 plus **voxel-space label smoothness**: penalize squared difference of **softmax** predictions on **6-neighbor** edges (×/y/z in the voxel grid), encouraging piecewise-constant predictions over geometry |
 
-<p align="center">
-  <img src="./media/demo.gif" width="75%" />
-</p>
+Unmasked entropy on all unlabeled points (TENT-style) can hurt noisy low-coverage points; the H2 mask is meant to avoid that. **Spatial loss** targets **local consistency** of the adapter output (not the frozen features); by default edges are restricted to **unlabeled–unlabeled** pairs so labeled pixels are not pulled toward neighbors.
 
+---
 
-Here we present a **real-time**, **interactive**, **open-vocabulary** scene understanding tool. A user can type in an arbitrary query phrase like **`snoopy`** (rare object), **`somewhere soft`** (property), **`made of metal`** (material), **`where can I cook?`** (activity), **`festive`** (abstract concept) etc, and the correponding regions are highlighted.
+## Experimental setup (summary)
 
+- **Dataset:** Matterport3D, **21** semantic classes (same label set as OpenScene Matterport config).
+- **Features:** Pre-fused OpenSeg features (768-d), read from disk; **not** recomputed during training.
+- **Train split:** `data_root/train/*.pth` — 3D points + labels; fused features match by scene name under `data_root_2d_fused_feature`.
+- **Test split:** `data_root/test/*.pth` — full test evaluation (406 scenes in the public OpenScene setup).
+- **Low-label protocol:** For each training scene, a **fixed** set of point indices: **5%** of valid (`label ≠ ignore`) points, **class-balanced**, minimum **1** point per present class, **seed 42**. Stored as one `.npy` per scene (see below).
+- **Optimizer:** Adam, `lr=1e-4`, `weight_decay=1e-4`, cosine LR schedule over **50** epochs.
+- **Checkpoint:** Best training loss → `model_best.pth.tar` under `<save_path>/model/`.
 
-## Installation
-Follow the [installation.md](installation.md) to install all required packages so you can do the evaluation & distillation afterwards.
+**Entropy branch (H2 and spatial configs):**
 
-## Data Preparation
+- `lambda2`: weight on `L_ent` (default `0.1`).
+- `entropy_tau`: predictive-entropy threshold in nats (default `1.52 ≈ 0.5 × log(21)`). Only unlabeled points with `H(pred) < τ` contribute to `L_ent`.
+- `entropy_warmup_epochs`: ramp `λ₂` from 0 over the first N epochs (default `5`) so supervision stabilizes first.
 
-We provide the **pre-processed 3D&2D data** and **multi-view fused features** for the following datasets:
-- ScanNet
-- Matterport3D
-- nuScenes
-- Replica
-### Pre-processed 3D&2D Data
-You can preprocess the dataset yourself, see the [data pre-processing instruction](scripts/preprocess/README.md).
+**Spatial smoothing (`adapter_spatial_smooth.yaml`):**
 
+- `lambda_spatial` (`λ_sp`): weight on **`L_spatial`** (mean squared difference of softmax probabilities across 6-connected voxel neighbors among **visible** voxels).
+- `spatial_smooth_unlabeled_only` (default `True`): drop edges touching labeled voxels so `L_sup` stays the anchor for annotated points.
+- `spatial_max_edges`: cap edges per chunk (`0` = no cap).
+- `spatial_warmup_epochs`: same idea as entropy warm-up—increase λ_sp gradually (default `5`).
 
-Alternatively, we have provided the preprocessed datasets. One can download the pre-processed datasets by running the script below, and following the command line instruction to download the corresponding datasets:
-```bash
-bash scripts/download_dataset.sh
+**Evaluation extras:** Optional **H2 diagnostic** buckets test points by quartiles of **baseline fusion confidence** (from a one-time Run-0 pass). That checks whether accuracy improvements concentrate in high- vs low-confidence regions.
+
+---
+
+## Results summary
+
+Reported metric: **Mean IoU (21 Matterport classes)** on the Matterport **test** split. **Run 0:** zero-shot fusion (`run/evaluate.py` with `eval_fusion_baseline.yaml`). **Runs 1–3:** adapter checkpoints via `run/evaluate_adapter.py`, trained with **5% class-balanced labeled points per train scene**, frozen fused OpenSeg features.
+
+| Run | Config | Objective | **mIoU** |
+|-----|--------|-------------|-----------|
+| 0 *(fusion baseline)* | `eval_fusion_baseline.yaml` | Zero-shot fusion (no adapter) | **40.04%** |
+| 1 | `adapter_sup_only.yaml` | `L_sup` only | **48.79%** |
+| 2 | `adapter_with_entropy.yaml` (`τ=1.52`, `λ₂=0.1`, warm-up 5 ep) | `L_sup + λ₂ L_ent` (masked entropy) | **48.26%** |
+| 3 | `adapter_spatial_smooth.yaml` (same H2 + `λ_sp=0.02`, warm-up 5 ep) | `L_sup + λ₂ L_ent + λ_sp L_spatial` | **48.89%** |
+
+**Takeaway:** Fusion-only baseline **40.04%** mIoU; training the adapter with **5% labels** raises it to **48.79%**. Under the original H2 entropy settings (`entropy_tau ≈ ½ × log(21)`), adding masked entropy alone **slightly hurt** mIoU (−0.53 pp vs supervised-only). Adding **spatial softmax smoothness** on top of H2 recovers and **slightly exceeds** supervised-only (**+0.10 pp**). Diagnosis for the entropy-only run: **`τ` was too lenient**, so nearly all unlabeled points passed the confidence mask (`frac_confident` grew from ~0.72 toward ~**0.98**), so `L_ent` behaved like near **unmasked** entropy across most points—not the intended selective regularization.
+
+**Next steps recorded in docs:** Sweep **stricter τ** (e.g. `adapter_entropy_tau03.yaml`, `tau05.yaml`, `tau07.yaml`) and stabilize the labeled mask (fixed per-scene indices + balanced sampling)—see `.claude/h2-plan.md` / `H2_PLAN.md`.
+
+**Artifacts:** Primary numbers come from **`run/evaluate_adapter.py`** stdout and files under `$save_folder`; TensorBoard curves under `$save_path` show `loss/total`, `L_sup`, `L_ent`, `frac_confident`, and **`L_spatial`** when spatial smoothing is enabled.
+
+---
+
+## Prerequisites
+
+### 1) Download Matterport3D (OpenScene release)
+
+Skip this if you already use **read-only shared data** on the cluster (see `RUNNING_ON_UNITY.md`). Otherwise download from the OpenScene CVG server, unzip into a writable directory, and point `data_root` / `data_root_2d_fused_feature` at the extracted folders (expected layout: `.../matterport_3d/train/`, `.../matterport_3d/test/`, plus fused `.pt` files).
+
+| What | URL |
+|------|-----|
+| **3D point clouds + labels** (train/test `.pth`) | https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d.zip |
+| **Test fused OpenSeg features** (large, ~66.7 GB) | https://cvg-data.inf.ethz.ch/openscene/data/matterport_multiview_openseg_test.zip |
+
+Upstream helpers (optional): `bash scripts/download_dataset.sh` (Matterport 3D) and `bash scripts/download_fused_features.sh` (includes test OpenSeg features). Full OpenScene data notes: `README.md` in this repo.
+
+### 2) Layout
+
+`data_root` must look like:
+
+```text
+data_root/
+  train/*.pth   # training scenes
+  test/*.pth    # evaluation scenes
 ```
-The script will download and unpack data into the folder `data/`. One can also download the dataset somewhere else, but link to the corresponding folder with the symbolic link:
-```bash
-ln -s /PATH/TO/DOWNLOADED/FOLDER data
-```
-<details>
-  <summary><strong>List of provided processed data</strong> (click to expand):</summary>
-  
-  - ScanNet 3D (point clouds with GT semantic labels)
-  - ScanNet 2D (RGB-D images with camera poses)
-  - Matterport 3D (point clouds with GT semantic labels)
-  - Matterport 2D (RGB-D images with camera poses)
-  - nuScenes 3D (lidar point clouds with GT semantic labels)
-  - nuScenes 2D (RGB images with camera poses)
-  - Replica 3D (point clouds)
-  - Replica 2D (RGB-D images)
-  - Matterport 3D with top 40 NYU classes
-  - Matterport 3D with top 80 NYU classes
-  - Matterport 3D with top 160 NYU classes
-</details>
 
-**Note**: 2D processed datasets (e.g. `scannet_2d`) are only needed if you want to do multi-view feature fusion on your own. If so, please follow the [instruction for multi-view fusion](./scripts/feature_fusion/README.md).
+`data_root_2d_fused_feature` must contain the fused OpenSeg `.pt` files for **both** splits, keyed consistently with OpenScene (same layout as upstream).
 
-### Multi-view Fused Features
-To evaluate our OpenScene model or distill a 3D model, one needs to have the multi-view fused image feature for each 3D point (see method in Sec. 3.1 in the paper).
+### 3) Labeled split files (required for training)
 
-You can run the following to directly download provided fused features:
+Generate once from the **train** `.pth` files:
 
 ```bash
-bash scripts/download_fused_features.sh
+cd ~/repopt-3d/third_party/openscene
+PYTHONPATH=. python scripts/prepare_labeled_split.py \
+  --in_dir data/matterport_3d/train \
+  --out_dir data/matterport_labeled_indices/train \
+  --label_frac 0.05 \
+  --seed 42
 ```
-<details>
-  <summary><strong>List of provided fused features</strong> (click to expand):</summary>
-  
-  - ScanNet - Multi-view fused OpenSeg features, train/val (234.8G)
-  - ScanNet - Multi-view fused LSeg features, train/val (175.8G)
-  - Matterport - Multi-view fused OpenSeg features, train/val (198.3G)
-  - Matterport - Multi-view fused OpenSeg features, test set (66.7G)
-  - Replica - Multi-view fused OpenSeg features (9.0G)
-  - Matterport - Multi-view fused LSeg features (coming)
-  - nuScenes - Multi-view fused OpenSeg features (coming)
-  - nuScenes - Multi-view fused LSeg features (coming)
-</details>
 
+**Why:** Keeps the 5% supervision **reproducible** and **stable across epochs** (same indices per scene), instead of resampling every step.
 
-Alternatively, you can also generate multi-view features yourself following the [instruction](./scripts/feature_fusion/README.md).
+### 4) Baseline confidence for H2 diagnostic (optional but recommended)
 
+One fusion forward pass saves per-point confidence for test scenes (used at eval for quartile analysis, not for training loss):
 
-## Run
-When you have installed the environment and obtained the **processed 3D data** and **multi-view fused features**, you are ready to run our OpenScene disilled/ensemble model for 3D semantic segmentation, or distill your own model from scratch.
-
-### Evaluation for 3D Semantic Segmentation with a Pre-defined Labelsets
-<p align="center">
-  <img src="./media/benchmark_screenshot.jpg" width="80%" />
-</p>
-
-Here you can evaluate OpenScene features on different dataset (ScanNet/Matterport3D/nuScenes/Replica) that have pre-defined labelsets.
-We already include the following labelsets in [label_constants.py](dataset/label_constants.py):
-- ScanNet 20 classes (`wall`, `door`, `chair`, ...)
-- Matterport3D 21 classes (ScanNet 20 classes + `floor`)
-- Matterport top 40, 80, 160 NYU classes (more rare object classes)
-- nuScenes 16 classes (`road`, `bicycle`, `sidewalk`, ...)
-
-The general command to run evaluation:
 ```bash
-sh run/eval.sh EXP_DIR CONFIG.yaml feature_type
+PYTHONPATH=. python run/evaluate.py --config config/matterport/eval_fusion_baseline.yaml \
+  --save_confidence --confidence_save_dir data/matterport_baseline_confidence/test
 ```
-where you specify your experiment directory `EXP_DIR`, and replace `CONFIG.yaml` with the correct config file under [`config/`](./config/). **`feature_type`** corresponds to per-point OpenScene features:
-- `fusion`: The 2D multi-view fused features
-- `distill`: features from 3D distilled model 
-- `ensemble`: Our 2D-3D ensemble features
 
-To evaluate with `distill` and `ensemble`, the easiest way is to use a pre-trained 3D distilled model. You can do this by using one of the config files with postfix `_pretrained`. 
+Adjust `DATA` paths in `eval_fusion_baseline.yaml` or override on the CLI if your data lives elsewhere.
 
-For example, to evaluate the semantic segmentation on Replica, you can simply run:
+**Why:** The diagnostic compares adapter accuracy vs **baseline max-softmax** per point, binned by quartile.
+
+---
+
+## Configure paths
+
+Default YAMLs use **repository-relative** paths (`data/...`, `exp/...`). On the cluster, override without editing files:
+
 ```bash
-# 2D-3D ensemble
-sh run/eval.sh out/replica_openseg config/replica/ours_openseg_pretrained.yaml ensemble
-
-# Run 3D distilled model
-sh run/eval.sh out/replica_openseg config/replica/ours_openseg_pretrained.yaml distill
-
-# Evaluate with 2D fused features
-sh run/eval.sh out/replica_openseg config/replica/ours_openseg_pretrained.yaml fusion
+PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_sup_only.yaml \
+  data_root /path/to/matterport_3d \
+  data_root_2d_fused_feature /path/to/matterport_multiview_openseg_test \
+  save_path /path/to/experiments/adapter_sup_only \
+  labeled_indices_dir /path/to/matterport_labeled_indices/train
 ```
-The script will automatically download the pretrained 3D model and run the evaluation for Matterport 21 classes.
-You can find all outputs in the `out/replica_openseg`.
 
-For evaluation options, see under `TEST` inside `config/replica/ours_openseg_pretrained.yaml`. Below are important evaluation options that you might want to modify:
-- `labelset` (default: None, `scannet`| `matterport` | `matterport40`| `matterport80`|`matterport160`): Evaluate on a specific pre-defined labelset in [label_constants.py](./dataset/label_constants.py). If not specified, same as your 3D point cloud folder name
-- `eval_iou` (default: True): whether evaluating the mIoU. Set to `False` if there is no GT labels
-- `save_feature_as_numpy` (default: False): save the per-point features as `.npy`
-- `prompt_eng` (default: True): input class name X -> "a X in a scene"
-- `vis_gt` (default: True):  visualize point clouds with GT semantic labels
-- `vis_pred` (default: True): visualize point clouds with our predicted semantic labels
-- `vis_input` (default: True): visualize input point clouds
+Use the same pattern for `labeled_indices_dir`, `confidence_dir`, and `save_folder` under `evaluate_adapter.py`.
 
-If you want to use a 3D model distilled from scratch, specify the `model_path` to the correponding checkpoints `EXP/model/model_best.pth.tar`.
+---
 
+## Train
 
-### Distillation
-Finally, if you want to distill a new 3D model from scratch, run:
+From `openscene/`:
 
-- Start distilling:
-```sh run/distill.sh EXP_NAME CONFIG.yaml```
+**Supervised only**
 
-- Resume: 
-```sh run/resume_distill.sh EXP_NAME CONFIG.yaml```
-
-For available distillation options, please take a look at `DISTILL` inside `config/matterport/ours_openseg.yaml`
-
-
-### Using Your Own Datasets
-1. Follow the [data preprocessing instruction](./scripts/preprocess/README.md), modify codes accordingly to obtain the processed 2D&3D data
-2. Follow the [feature fusion instruction](./scripts/feature_fusion/README.md), modify codes to obtain multi-view fused features.
-3. You can distill a model on your own, or take our provided 3D distilled model weights (e.g. our 3D model for ScanNet or Matterport3D), and modify the `model_path` accordingly.
-4. If you want to evaluate on a specific labelset, change the `labelset` in config.
-
-
-## Applications
-Besides the zero-shot 3D semantic segmentation, we can perform also the following tasks:
-- **Open-vocabulary 3D scene understanding and exploration**: query a 3D scene to understand properties that extend beyond fixed category labels, e.g. materials, activity, affordances, room type, abstract concepts...
-- **Rare object search**: query a 3D scene database to find rare examples based on their names
-- **Image-based 3D object detection**: query a 3D scene database to retrieve examples based on similarities to a given input image
-
-## Acknowledgement
-We sincerely thank Golnaz Ghiasi for providing guidance on using OpenSeg model. Our appreciation extends to Huizhong Chen, Yin Cui, Tom Duerig, Dan Gnanapragasam, Xiuye Gu, Leonidas Guibas, Nilesh Kulkarni, Abhijit Kundu, Hao-Ning Wu, Louis Yang, Guandao Yang, Xiaoshuai Zhang, Howard Zhou, and Zihan Zhu for helpful discussion. We are also grateful to Charles R. Qi and Paul-Edouard Sarlin for their proofreading.
-
-We build some parts of our code on top of the [BPNet repository](https://github.com/wbhu/BPNet).
-
-
-## TODO
-- [ ] Support demo for arbitrary scenes
-- [ ] Support in-webiste demo
-- [x] Support multi-view feature fusion with LSeg
-- [x] Add missing multi-view fusion LSeg feature for Matterport & nuScenes
-- [x] Add missing multi-view fusion OpenSeg feature for nuScenes
-- [x] Multi-view feature fusion code for nuScenes
-- [ ] Support the latest PyTorch version
-
-We are very much welcome all kinds of contributions to the project.
-
-## Citation
-If you find our code or paper useful, please cite
-```bibtex
-@inproceedings{Peng2023OpenScene,
-  title     = {OpenScene: 3D Scene Understanding with Open Vocabularies},
-  author    = {Peng, Songyou and Genova, Kyle and Jiang, Chiyu "Max" and Tagliasacchi, Andrea and Pollefeys, Marc and Funkhouser, Thomas},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year      = {2023}
+```bash
+PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_sup_only.yaml
 ```
+
+**Supervised + confidence-masked entropy (H2)**
+
+```bash
+PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_with_entropy.yaml
+```
+
+**H2 + spatial softmax smoothness**
+
+```bash
+PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_spatial_smooth.yaml
+```
+
+TensorBoard logs are written under `<save_path>` (`loss/total`, `L_sup`, `L_ent`, `frac_confident`, and **`L_spatial`** when `lambda_spatial > 0`).
+
+---
+
+## Evaluate
+
+After training, evaluate on the **test** split and optionally run the H2 diagnostic:
+
+```bash
+PYTHONPATH=. python run/evaluate_adapter.py \
+  --config config/matterport/adapter_sup_only.yaml \
+  --model_path exp/adapter_sup_only/model/model_best.pth.tar \
+  --save_folder exp/adapter_sup_only/eval
+```
+
+Example for spatial smoothing (same pattern for `adapter_with_entropy.yaml`):
+
+```bash
+PYTHONPATH=. python run/evaluate_adapter.py \
+  --config config/matterport/adapter_spatial_smooth.yaml \
+  --model_path exp/adapter_spatial_smooth/model/model_best.pth.tar \
+  --save_folder exp/adapter_spatial_smooth/eval
+```
+
+Use `adapter_with_entropy.yaml` / `adapter_spatial_smooth.yaml` and matching `--model_path` / `--save_folder` when evaluating those runs (`exp/adapter_with_entropy/...`, `exp/adapter_spatial_smooth/...`). If baseline confidence files are not available:
+
+```bash
+PYTHONPATH=. python run/evaluate_adapter.py \
+  --config config/matterport/adapter_sup_only.yaml \
+  --model_path exp/adapter_sup_only/model/model_best.pth.tar \
+  --no_h2
+```
+
+The YAML `TEST` section already sets `split: test`, `confidence_dir`, and `do_h2_diagnostic`; CLI flags override when needed.
+
+---
+
+## Ablation configs
+
+Other loss variants live under `config/matterport/adapter_*.yaml` (e.g. `adapter_entropy_tau03.yaml`, `adapter_tent.yaml`, **`adapter_spatial_smooth.yaml`**). They use the same data and training script; only `ADAPTER` hyperparameters differ.
+
+---
+
+## Troubleshooting
+
+- **`0 file is loaded in the point loader`:** `data_root` does not contain a `train/` or `test/` folder with `.pth` files at the expected level, or paths are wrong.
+- **OOM on GPU:** Training uses batch size 1; reduce `workers` or scene size is handled by chunked loading—if issues persist, use a GPU with enough VRAM for the voxelized chunk.
+- **H2 diagnostic skipped:** Missing `test/<scene>.npy` under `confidence_dir` for some scenes, or `--no_h2` set.
+
+---
+
+## File reference
+
+| Item | Role |
+|------|------|
+| `run/train_adapter.py` | Training loop, `L_sup` / `L_ent` / optional spatial loss |
+| `run/evaluate_adapter.py` | Test mIoU + optional H2 quartile diagnostic |
+| `models/adapter.py` | `FeatureAdapter`, entropy helpers |
+| `scripts/prepare_labeled_split.py` | Builds per-scene labeled index `.npy` files |
+| `config/matterport/eval_fusion_baseline.yaml` | Run-0 fusion + `--save_confidence` |
