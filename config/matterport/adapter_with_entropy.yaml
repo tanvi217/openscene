@@ -1,15 +1,19 @@
-# Adapter training - confidence-masked entropy (H2 method, Run 2)
-# Loss: J = L_sup  +  lambda2 * L_ent
-#   tau    = log(21) * 0.5 ? 1.52 nats  (half of max entropy for K=21 classes)
-#   lambda2 = 0.1  (weight on L_ent)
+# =============================================================================
+# H2 adapter:  J = L_sup + lambda2 * L_ent
+#   L_ent = confidence-masked predictive entropy on unlabeled points
+#           (only points with H(pred) < entropy_tau contribute).
+# Full guide: README_ADAPTER.md
 #
-# Usage:
-#   cd ~/repopt-3d/third_party/openscene
-#   PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_with_entropy.yaml
+# Train:  PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_with_entropy.yaml
+# Eval:    PYTHONPATH=. python run/evaluate_adapter.py --config config/matterport/adapter_with_entropy.yaml
+#
+# Override paths (cluster): append space-separated key value pairs, e.g.
+#   data_root /work/.../matterport_3d  save_path /work/.../exp/adapter_with_entropy
+# =============================================================================
 
 DATA:
-  data_root: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_3d
-  data_root_2d_fused_feature: /work/pi_dagarwal_umass_edu/project_23/soorya/openscene/data/matterport_multiview_openseg_test
+  data_root: data/matterport_3d
+  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
   feature_2d_extractor: openseg
   classes: 21
   voxel_size: 0.02
@@ -28,14 +32,15 @@ ADAPTER:
   manual_seed: 42
   print_freq: 20
   save_freq: 10
-  save_path: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_with_entropy
+  save_path: exp/adapter_with_entropy
   resume:
   aug: False
   loop: 1
-  labeled_indices_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_labeled_indices/train
+  labeled_indices_dir: data/matterport_labeled_indices/train
   labeled_frac: 0.05
+  # Weight on masked entropy; tau in nats (approx half of max entropy for K=21)
   lambda2: 0.1
-  entropy_tau: 1.52   # log(21) * 0.5 nats
+  entropy_tau: 1.52   # ~ log(21) * 0.5
   entropy_unmasked: False
   entropy_mode: hard_mask
   entropy_warmup_epochs: 5
@@ -45,9 +50,9 @@ TEST:
   test_workers: 4
   test_gpu: [0]
   test_batch_size: 1
-  model_path:
-  save_folder: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_with_entropy/eval
-  confidence_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_baseline_confidence/test
+  model_path: exp/adapter_with_entropy/model/model_best.pth.tar
+  save_folder: exp/adapter_with_entropy/eval
+  confidence_dir: data/matterport_baseline_confidence/test
   do_h2_diagnostic: True
 
 Distributed:

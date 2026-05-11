@@ -1,13 +1,20 @@
-# Adapter training - supervised only (ablation Run 1)
-# Loss: J = L_sup  (lambda2 = 0, no entropy regulariser)
+# =============================================================================
+# Supervised-only adapter (ablation):  J = L_sup
+#   Frozen OpenSeg features → residual MLP + linear head; CE on 5% labeled points.
+# Full guide: README_ADAPTER.md
 #
-# Usage:
-#   cd ~/repopt-3d/third_party/openscene
-#   PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_sup_only.yaml
+# Train:  PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_sup_only.yaml
+# Eval:    PYTHONPATH=. python run/evaluate_adapter.py --config config/matterport/adapter_sup_only.yaml
+#
+# Override paths (cluster): append space-separated key value pairs, e.g.
+#   data_root /work/.../matterport_3d  save_path /work/.../exp/adapter_sup_only
+# =============================================================================
 
 DATA:
-  data_root: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_3d
-  data_root_2d_fused_feature: /work/pi_dagarwal_umass_edu/project_23/soorya/openscene/data/matterport_multiview_openseg_test
+  # Parent of train/ and test/ containing *.pth scenes
+  data_root: data/matterport_3d
+  # Fused OpenSeg .pt features (must cover train + test scenes)
+  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
   feature_2d_extractor: openseg
   classes: 21
   voxel_size: 0.02
@@ -26,12 +33,14 @@ ADAPTER:
   manual_seed: 42
   print_freq: 20
   save_freq: 10
-  save_path: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_sup_only
+  save_path: exp/adapter_sup_only
   resume:
   aug: False
   loop: 1
-  labeled_indices_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_labeled_indices/train
+  # From scripts/prepare_labeled_split.py (one .npy per train scene)
+  labeled_indices_dir: data/matterport_labeled_indices/train
   labeled_frac: 0.05
+  # Entropy branch disabled
   lambda2: 0.0
   entropy_tau:
   entropy_unmasked: False
@@ -43,9 +52,11 @@ TEST:
   test_workers: 4
   test_gpu: [0]
   test_batch_size: 1
-  model_path:
-  save_folder: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_sup_only/eval
-  confidence_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_baseline_confidence/test
+  # Default eval checkpoint (exists after train saves model_best)
+  model_path: exp/adapter_sup_only/model/model_best.pth.tar
+  save_folder: exp/adapter_sup_only/eval
+  # Per-scene Run-0 fusion confidence .npy (see eval_fusion_baseline.yaml)
+  confidence_dir: data/matterport_baseline_confidence/test
   do_h2_diagnostic: True
 
 Distributed:

@@ -21,6 +21,9 @@
 #
 # Optional extra train (set to 1):
 #   RUN_TENT      After Run 2, train adapter_tent.yaml (TENT ablation)
+#   RUN_INV       Train/eval inverted-mask entropy (H > tau), compare to H2 (H < tau)
+#   RUN_SPATIAL   Train/eval H2 + spatial neighbor probability smoothing
+#   RUN_ALL_METHODS  Run tau sweeps + soft/pseudo/temp methods from h2-plan
 #
 # Unity concrete paths: source scripts/h2_pipeline_env_unity.sh (see that file).
 #
@@ -53,6 +56,18 @@ SKIP_RUN0="${SKIP_RUN0:-0}"
 SKIP_RUN1="${SKIP_RUN1:-0}"
 SKIP_RUN2="${SKIP_RUN2:-0}"
 RUN_TENT="${RUN_TENT:-0}"
+RUN_INV="${RUN_INV:-0}"
+RUN_SPATIAL="${RUN_SPATIAL:-0}"
+RUN_ALL_METHODS="${RUN_ALL_METHODS:-0}"
+
+SAVE_TAU03="${SAVE_TAU03:-${OPENSCENE_ROOT}/experiments/adapter_entropy_tau03}"
+SAVE_TAU05="${SAVE_TAU05:-${OPENSCENE_ROOT}/experiments/adapter_entropy_tau05}"
+SAVE_TAU07="${SAVE_TAU07:-${OPENSCENE_ROOT}/experiments/adapter_entropy_tau07}"
+SAVE_SOFT="${SAVE_SOFT:-${OPENSCENE_ROOT}/experiments/adapter_soft_entropy}"
+SAVE_PSEUDO="${SAVE_PSEUDO:-${OPENSCENE_ROOT}/experiments/adapter_pseudo_label}"
+SAVE_SHARP="${SAVE_SHARP:-${OPENSCENE_ROOT}/experiments/adapter_temp_sharpen}"
+SAVE_INV="${SAVE_INV:-${OPENSCENE_ROOT}/experiments/adapter_inverted_mask}"
+SAVE_SPATIAL="${SAVE_SPATIAL:-${OPENSCENE_ROOT}/experiments/adapter_spatial_smooth}"
 
 echo "==> OpenScene root: ${OPENSCENE_ROOT}"
 echo "==> MP_ROOT=${MP_ROOT}"
@@ -130,6 +145,27 @@ else
   echo '>>> Skipping Run 2; SKIP_RUN2=1'
 fi
 
+run_train_eval() {
+  local cfg="$1"
+  local save_path="$2"
+  local tag="$3"
+  echo ""
+  echo ">>> Train: ${tag}"
+  python run/train_adapter.py \
+    --config "${cfg}" \
+    data_root "${MP_ROOT}" \
+    data_root_2d_fused_feature "${FUSED_ROOT}" \
+    labeled_indices_dir "${LABELED_OUT}" \
+    save_path "${save_path}"
+  echo ">>> Evaluate: ${tag}"
+  python run/evaluate_adapter.py \
+    --config "${cfg}" \
+    --model_path "${save_path}/model/model_best.pth.tar" \
+    --confidence_dir "${CONF_OUT}" \
+    data_root "${MP_ROOT}" \
+    data_root_2d_fused_feature "${FUSED_ROOT}"
+}
+
 if [[ "${RUN_TENT}" == "1" ]]; then
   SAVE_TENT="${SAVE_TENT:-${OPENSCENE_ROOT}/experiments/adapter_tent}"
   echo ""
@@ -149,6 +185,30 @@ if [[ "${RUN_TENT}" == "1" ]]; then
     --confidence_dir "${CONF_OUT}" \
     data_root "${MP_ROOT}" \
     data_root_2d_fused_feature "${FUSED_ROOT}"
+fi
+
+if [[ "${RUN_INV}" == "1" ]]; then
+  run_train_eval \
+    "config/matterport/adapter_inverted_mask.yaml" \
+    "${SAVE_INV}" \
+    "Inverted mask entropy (H > tau)"
+fi
+
+if [[ "${RUN_SPATIAL}" == "1" ]]; then
+  run_train_eval \
+    "config/matterport/adapter_spatial_smooth.yaml" \
+    "${SAVE_SPATIAL}" \
+    "H2 + spatial smoothness (6-neighbor probs)"
+fi
+
+if [[ "${RUN_ALL_METHODS}" == "1" ]]; then
+  # run_train_eval "config/matterport/adapter_entropy_tau03.yaml" "${SAVE_TAU03}" "H2 tau=0.3"
+  # run_train_eval "config/matterport/adapter_entropy_tau05.yaml" "${SAVE_TAU05}" "H2 tau=0.5"
+  # run_train_eval "config/matterport/adapter_entropy_tau07.yaml" "${SAVE_TAU07}" "H2 tau=0.7"
+  # run_train_eval "config/matterport/adapter_soft_entropy.yaml" "${SAVE_SOFT}" "Soft-weight entropy"
+  # run_train_eval "config/matterport/adapter_pseudo_label.yaml" "${SAVE_PSEUDO}" "Pseudo-label"
+  # run_train_eval "config/matterport/adapter_temp_sharpen.yaml" "${SAVE_SHARP}" "Temperature sharpen"
+  run_train_eval "config/matterport/adapter_inverted_mask.yaml" "${SAVE_INV}" "Inverted mask entropy (H > tau)"
 fi
 
 echo ""

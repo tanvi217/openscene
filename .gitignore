@@ -133,3 +133,4 @@ dmypy.json
 out
 3rdParty
 initmodel
+.claude/

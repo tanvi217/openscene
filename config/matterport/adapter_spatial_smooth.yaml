@@ -1,14 +1,16 @@
-# H2 + spatial smoothness on voxel neighbors (6-connected grid).
-# L = L_sup + lambda2 * L_ent + lambda_spatial * sum_{(i,j) in E} ||pi_i - pi_j||^2
-# where pi = softmax(logits). Edges join axis-adjacent visible voxels; by default
-# only edges between two unlabeled visible points are included.
+# =============================================================================
+# H2 + spatial smoothness on 6-neighbor voxel edges:
+#   J = L_sup + lambda2 * L_ent + lambda_spatial * L_spatial
+# L_spatial = mean ( ||softmax(z_i) - softmax(z_j)||^2 ) over visible +x/+y/+z edges;
+# by default only edges between two unlabeled visible voxels (spatial_smooth_unlabeled_only).
+# README: README_ADAPTER.md
 #
-# Usage:
-#   PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_spatial_smooth.yaml
+# Train: PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_spatial_smooth.yaml
+# =============================================================================
 
 DATA:
-  data_root: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_3d
-  data_root_2d_fused_feature: /work/pi_dagarwal_umass_edu/project_23/soorya/openscene/data/matterport_multiview_openseg_test
+  data_root: data/matterport_3d
+  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
   feature_2d_extractor: openseg
   classes: 21
   voxel_size: 0.02
@@ -27,11 +29,11 @@ ADAPTER:
   manual_seed: 42
   print_freq: 20
   save_freq: 10
-  save_path: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_spatial_smooth
+  save_path: exp/adapter_spatial_smooth
   resume:
   aug: False
   loop: 1
-  labeled_indices_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_labeled_indices/train
+  labeled_indices_dir: data/matterport_labeled_indices/train
   labeled_frac: 0.05
   lambda2: 0.1
   entropy_tau: 1.52
@@ -48,9 +50,9 @@ TEST:
   test_workers: 4
   test_gpu: [0]
   test_batch_size: 1
-  model_path:
-  save_folder: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/experiments/adapter_spatial_smooth/eval
-  confidence_dir: /work/pi_adamoneill_umass_edu/tanviagarwal_umass_edu/openscene/matterport_baseline_confidence/test
+  model_path: exp/adapter_spatial_smooth/model/model_best.pth.tar
+  save_folder: exp/adapter_spatial_smooth/eval
+  confidence_dir: data/matterport_baseline_confidence/test
   do_h2_diagnostic: True
 
 Distributed:
