@@ -1,5 +1,6 @@
-# Run 3 (optional): supervised + vanilla entropy minimization on all unlabeled points (TENT-style).
-# Tests whether the confidence mask matters vs H2 (adapter_with_entropy.yaml).
+# Run 3 / H1 (same as config/matterport/adapter_h1.yaml; legacy filename "tent").
+# Supervised + vanilla entropy on all unlabeled points (TENT-style).
+# Prefer adapter_h1.yaml + scripts/run_adapter_h1.sh for new runs.
 #
 # Loss: J = L_sup + lambda2 * mean(H) over unlabeled points (no masking).
 #

@@ -69,7 +69,7 @@ def confidence_masked_entropy(logits, tau):
 
 
 def inverted_masked_entropy(logits, tau):
-    """Entropy minimization on the *uncertain* subset (inverse H2 mask).
+    """Entropy minimization on the *uncertain* subset (H3 / inverse H2 mask).
 
     Same detached hard mask as ``confidence_masked_entropy``, but selects
     points with H(y_i) > tau. Mean entropy is averaged only over that subset.

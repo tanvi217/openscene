@@ -1,0 +1,63 @@
+# =============================================================================
+# H3 adapter:  J = L_sup + lambda2 * L_ent   (20 epochs)
+#   L_ent = predictive entropy averaged only over unlabeled points with
+#           H(pred) > entropy_tau  (inverse of H2: emphasize uncertain points).
+#   Implemented as entropy_mode: inverted_mask → inverted_masked_entropy().
+#
+# Train:  PYTHONPATH=. python run/train_adapter.py --config config/matterport/adapter_h3.yaml
+# Eval:   PYTHONPATH=. python run/evaluate_adapter.py --config config/matterport/adapter_h3.yaml
+#
+# Composite 3D root (train+test symlinks): run once
+#   bash scripts/setup_matterport_adapter_symlinks.sh
+# Override paths:  data_root /path/...  save_path /path/...
+# =============================================================================
+
+DATA:
+  data_root: data_matterport_adapter/matterport_3d
+  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
+  feature_2d_extractor: openseg
+  classes: 21
+  voxel_size: 0.02
+  input_color: False
+  use_shm: False
+
+ADAPTER:
+  feat_dim: 768
+  ignore_label: 255
+  train_gpu: [0]
+  workers: 4
+  base_lr: 0.0001
+  weight_decay: 0.0001
+  epochs: 20
+  start_epoch: 0
+  manual_seed: 42
+  print_freq: 20
+  save_freq: 5
+  save_path: exp/adapter_h3
+  resume:
+  aug: False
+  loop: 1
+  labeled_indices_dir: data/matterport_labeled_indices/train
+  labeled_frac: 0.05
+  lambda2: 0.1
+  entropy_tau: 1.52
+  entropy_unmasked: False
+  entropy_mode: inverted_mask
+  entropy_warmup_epochs: 5
+
+TEST:
+  split: test
+  test_workers: 4
+  test_gpu: [0]
+  test_batch_size: 1
+  model_path: exp/adapter_h3/model/model_best.pth.tar
+  save_folder: exp/adapter_h3/eval
+  confidence_dir: data/matterport_baseline_confidence/test
+  do_h2_diagnostic: True
+
+Distributed:
+  dist_url: tcp://127.0.0.1:6789
+  dist_backend: 'nccl'
+  multiprocessing_distributed: False
+  world_size: 1
+  rank: 0

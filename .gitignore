@@ -1,4 +1,6 @@
 data
+# Local composite: train/test symlinks (see scripts/setup_matterport_adapter_symlinks.sh)
+data_matterport_adapter/
 saved_text_embeddings
 # Created by .ignore support plugin (hsz.mobi)
 ### Python template

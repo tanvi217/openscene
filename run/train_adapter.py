@@ -18,6 +18,12 @@ Usage (from the openscene/ root directory):
 
   # With confidence-masked entropy (Run 2, H2 method):
   python run/train_adapter.py --config config/matterport/adapter_with_entropy.yaml
+
+  # H1 — vanilla entropy on all unlabeled points (TENT-style; entropy_mode unmasked):
+  python run/train_adapter.py --config config/matterport/adapter_h1.yaml
+
+  # H3 — entropy on uncertain points only (inverted mask; entropy_mode inverted_mask):
+  python run/train_adapter.py --config config/matterport/adapter_h3.yaml
 """
 import os
 import random
