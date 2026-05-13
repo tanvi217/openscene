@@ -1,10 +1,14 @@
 """Train a lightweight feature adapter on frozen OpenScene fused features.
 
-Loss: J = L_sup + lambda2 * L_ent + lambda_spatial * L_spatial (optional)
+Loss: J = L_sup + entropy_term + lambda_spatial * L_spatial (optional)
 
   L_sup -- cross-entropy on the labeled 5% of points per scene
   L_ent -- masked entropy on unlabeled points (H2 regulariser by default:
            only points with H(y_i) < tau; use entropy_mode inverted_mask for H > tau)
+  entropy_mode combined_h2_h3_spatial / combined_h1_h2_h3_spatial --
+           optional lambda_h1 * vanilla entropy (H1) plus lambda2 * H2 (masked),
+           lambda2_inverted * H3 (inverted mask), plus lambda_spatial when set.
+           H2/H3 require entropy_tau; set lambda_h1: 0 to omit H1.
   L_spatial -- mean squared difference of softmax probabilities on 6-neighbor
            voxel edges among visible points (see lambda_spatial, spatial_* options)
 
@@ -21,6 +25,9 @@ Usage (from the openscene/ root directory):
 
   # H1 — vanilla entropy on all unlabeled points (TENT-style; entropy_mode unmasked):
   python run/train_adapter.py --config config/matterport/adapter_h1.yaml
+
+  # H2 + H3 + optional H1 + spatial (entropy_mode combined_h1_h2_h3_spatial):
+  python run/train_adapter.py --config config/matterport/adapter_combined_h2_h3_spatial.yaml
 
   # H3 — entropy on uncertain points only (inverted mask; entropy_mode inverted_mask):
   python run/train_adapter.py --config config/matterport/adapter_h3.yaml
@@ -278,6 +285,20 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         lambda2_effective = lambda2 * min(1.0, float(epoch + 1) / float(warmup_epochs))
     else:
         lambda2_effective = lambda2
+    lambda2_inverted = float(getattr(args, 'lambda2_inverted', 0.0))
+    if warmup_epochs > 0:
+        lambda2_inv_effective = lambda2_inverted * min(
+            1.0, float(epoch + 1) / float(warmup_epochs)
+        )
+    else:
+        lambda2_inv_effective = lambda2_inverted
+    lambda_h1 = float(getattr(args, 'lambda_h1', 0.0))
+    if warmup_epochs > 0:
+        lambda_h1_effective = lambda_h1 * min(
+            1.0, float(epoch + 1) / float(warmup_epochs)
+        )
+    else:
+        lambda_h1_effective = lambda_h1
 
     for i, (coords, feat, labels, feat_3d, mask, scene_names, inds_list) in enumerate(
             tqdm(train_loader, desc=f'Epoch {epoch + 1}/{args.epochs}')):
@@ -351,10 +372,62 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
         # L_ent: masked entropy (H2) or vanilla entropy (TENT / Run 3)
         is_unlabeled_vis = ~is_labeled_vis
         frac_conf = 0.0
-        if lambda2_effective > 0.0 and is_unlabeled_vis.sum() > 0:
+        entropy_loss = torch.tensor(0.0, device='cuda')
+        use_entropy = is_unlabeled_vis.sum() > 0 and (
+            lambda2_effective > 0.0
+            or lambda2_inv_effective > 0.0
+            or lambda_h1_effective > 0.0
+        )
+        if use_entropy:
             logits_u = logits[is_unlabeled_vis]
-            if entropy_mode == 'pseudo_label':
+            if entropy_mode in (
+                'combined_h2_h3_spatial',
+                'combined_h1_h2_h3_spatial',
+            ):
+                ent_parts = []
+                dbg_tensors = []
+                if lambda_h1_effective > 0.0:
+                    l1 = vanilla_entropy_minimization(logits_u)
+                    ent_parts.append(lambda_h1_effective * l1)
+                    dbg_tensors.append(l1.detach())
+                if lambda2_effective > 0.0:
+                    if entropy_tau is None:
+                        raise ValueError(
+                            'combined entropy: lambda2 > 0 requires entropy_tau'
+                        )
+                    l2 = confidence_masked_entropy(
+                        logits_u, tau=float(entropy_tau)
+                    )
+                    ent_parts.append(lambda2_effective * l2)
+                    dbg_tensors.append(l2.detach())
+                if lambda2_inv_effective > 0.0:
+                    if entropy_tau is None:
+                        raise ValueError(
+                            'combined entropy: lambda2_inverted > 0 requires entropy_tau'
+                        )
+                    l3 = inverted_masked_entropy(
+                        logits_u, tau=float(entropy_tau)
+                    )
+                    ent_parts.append(lambda2_inv_effective * l3)
+                    dbg_tensors.append(l3.detach())
+                if not ent_parts:
+                    entropy_loss = torch.tensor(0.0, device='cuda')
+                    L_ent = entropy_loss
+                else:
+                    entropy_loss = ent_parts[0]
+                    for t in ent_parts[1:]:
+                        entropy_loss = entropy_loss + t
+                    L_ent = torch.stack(dbg_tensors).mean()
+                with torch.no_grad():
+                    H_u = predictive_entropy(logits_u)
+                    frac_conf = (
+                        (H_u < float(entropy_tau)).float().mean().item()
+                        if entropy_tau is not None
+                        else 0.0
+                    )
+            elif entropy_mode == 'pseudo_label':
                 L_ent, frac_conf = pseudo_label_loss(logits_u, threshold=pseudo_thr)
+                entropy_loss = lambda2_effective * L_ent
             elif entropy_mode == 'temp_sharpen':
                 L_ent = temperature_sharpening_loss(logits_u, sharpening_temp=sharp_temp)
                 with torch.no_grad():
@@ -363,6 +436,7 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
                         (H_u < float(entropy_tau)).float().mean().item()
                         if entropy_tau is not None else 0.0
                     )
+                entropy_loss = lambda2_effective * L_ent
             elif entropy_mode == 'soft_weight':
                 L_ent = soft_weighted_entropy(logits_u, temperature=soft_temp)
                 with torch.no_grad():
@@ -370,6 +444,7 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
                     frac_conf = (
                         torch.exp(-H_u / soft_temp).mean().item()
                     )
+                entropy_loss = lambda2_effective * L_ent
             elif entropy_unmasked or entropy_mode == 'unmasked':
                 L_ent = vanilla_entropy_minimization(logits_u)
                 with torch.no_grad():
@@ -378,18 +453,22 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
                         (H_u < float(entropy_tau)).float().mean().item()
                         if entropy_tau is not None else 0.0
                     )
+                entropy_loss = lambda2_effective * L_ent
             elif entropy_mode == 'inverted_mask' and entropy_tau is not None:
                 L_ent = inverted_masked_entropy(logits_u, tau=float(entropy_tau))
                 with torch.no_grad():
                     H_u = predictive_entropy(logits_u)
                     frac_conf = (H_u > float(entropy_tau)).float().mean().item()
+                entropy_loss = lambda2_effective * L_ent
             elif entropy_tau is not None:
                 L_ent = confidence_masked_entropy(logits_u, tau=float(entropy_tau))
                 with torch.no_grad():
                     H_u = predictive_entropy(logits_u)
                     frac_conf = (H_u < float(entropy_tau)).float().mean().item()
+                entropy_loss = lambda2_effective * L_ent
             else:
                 L_ent = torch.tensor(0.0, device='cuda')
+                entropy_loss = lambda2_effective * L_ent
         else:
             L_ent = torch.tensor(0.0, device='cuda')
 
@@ -407,7 +486,7 @@ def train_one_epoch(train_loader, adapter, optimizer, epoch):
                 ei = torch.from_numpy(edges_np).long().cuda()
                 L_spatial = spatial_probability_smoothness(logits, ei)
 
-        loss = L_sup + lambda2_effective * L_ent + lambda_sp_effective * L_spatial
+        loss = L_sup + entropy_loss + lambda_sp_effective * L_spatial
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
